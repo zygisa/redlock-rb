@@ -4,6 +4,9 @@ require 'securerandom'
 module Redlock
   include Scripts
 
+  class RedisTooManyFailuresError < StandardError
+  end
+
   class Client
     DEFAULT_REDIS_HOST    = ENV["DEFAULT_REDIS_HOST"] || "localhost"
     DEFAULT_REDIS_PORT    = ENV["DEFAULT_REDIS_PORT"] || "6379"
@@ -172,6 +175,9 @@ module Redlock
             conn.call('EVALSHA', Scripts::LOCK_SCRIPT_SHA, 1, resource, val, ttl, allow_new_lock)
           }
         end
+
+      rescue Redis::BaseError => e
+        return e
       end
 
       def unlock(resource, val)
@@ -233,13 +239,21 @@ module Redlock
       retry_count = options[:retry_count] || @retry_count
       tries = options[:extend] ? 1 : (retry_count + 1)
 
+      last_error = nil
+
       tries.times do |attempt_number|
         # Wait a random delay before retrying.
         sleep(attempt_retry_delay(attempt_number, options)) if attempt_number > 0
 
         lock_info = lock_instances(resource, ttl, options)
+
         return lock_info if lock_info
+
+      rescue => e
+        last_error = e
       end
+
+      raise last_error if last_error
 
       false
     end
@@ -262,8 +276,12 @@ module Redlock
       value = (options[:extend] || { value: SecureRandom.uuid })[:value]
       allow_new_lock = options[:extend_only_if_locked] ? 'no' : 'yes'
 
+      errors = []
+
       locked, time_elapsed = timed do
-        @servers.select { |s| s.lock resource, value, ttl, allow_new_lock }.size
+        @servers.map { |s| s.lock(resource, value, ttl, allow_new_lock) }
+          .each { |e| errors << e if e.kind_of? Exception }
+          .select { |l| !l.kind_of? Exception }.size
       end
 
       validity = ttl - time_elapsed - drift(ttl)
@@ -272,7 +290,12 @@ module Redlock
         { validity: validity, resource: resource, value: value }
       else
         @servers.each { |s| s.unlock(resource, value) }
-        false
+
+        if errors.size >= @quorum
+          raise RedisTooManyFailuresError, "Too many Redis failures prevented lock acquisition: #{errors}"
+        else
+          false
+        end
       end
     end
 
