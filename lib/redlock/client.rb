@@ -201,63 +201,39 @@ module Redlock
       end
 
       def lock(resource, val, ttl, allow_new_lock)
-        recover_from_script_flush do
-          synchronize { |conn|
-            conn.call('EVALSHA', Scripts::LOCK_SCRIPT_SHA, 1, resource, val, ttl, allow_new_lock)
-          }
-        end
+        args = [1, resource, val, ttl, allow_new_lock]
+        call_redis_with_fallback(Scripts::LOCK_SCRIPT_SHA, Scripts::LOCK_SCRIPT, *args)
       end
 
       def unlock(resource, val)
-        recover_from_script_flush do
-          synchronize { |conn|
-            conn.call('EVALSHA', Scripts::UNLOCK_SCRIPT_SHA, 1, resource, val)
-          }
-        end
+        args = [1, resource, val]
+        call_redis_with_fallback(Scripts::UNLOCK_SCRIPT_SHA, Scripts::UNLOCK_SCRIPT, *args)
       rescue
         # Nothing to do, unlocking is just a best-effort attempt.
       end
 
       def get_remaining_ttl(resource)
-        recover_from_script_flush do
-          synchronize { |conn|
-            conn.call('EVALSHA', Scripts::PTTL_SCRIPT_SHA, 1, resource)
-          }
-        end
+        args = [1, resource]
+        call_redis_with_fallback(Scripts::PTTL_SCRIPT_SHA, Scripts::PTTL_SCRIPT, *args)
       rescue RedisClient::ConnectionError
         nil
       end
 
       private
 
-      def load_scripts
-        scripts = [
-          Scripts::UNLOCK_SCRIPT,
-          Scripts::LOCK_SCRIPT,
-          Scripts::PTTL_SCRIPT
-        ]
-
-        synchronize do |connnection|
-          scripts.each do |script|
-            connnection.call('SCRIPT', 'LOAD', script)
-          end
-        end
-      end
-
-      def recover_from_script_flush
+      def call_redis_with_fallback(script_sha, script, *args)
         retry_on_noscript = true
-        begin
-          yield
-        rescue RedisClient::CommandError => e
-          # When somebody has flushed the Redis instance's script cache, we might
-          # want to reload our scripts. Only attempt this once, though, to avoid
-          # going into an infinite loop.
-          if retry_on_noscript && e.message.include?('NOSCRIPT')
-            load_scripts
-            retry_on_noscript = false
-            retry
-          else
-            raise
+        synchronize do |conn|
+          begin
+            conn.call('EVALSHA', script_sha, *args)
+          rescue RedisClient::CommandError => e
+            if retry_on_noscript && e.message.include?('NOSCRIPT')
+              conn.call('EVAL', script, *args)
+              retry_on_noscript = false
+              retry
+            else
+              raise
+            end
           end
         end
       end
